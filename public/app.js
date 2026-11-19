@@ -78,6 +78,7 @@
     editor: false,
     protected: false,
     adminMode: false,
+    streamingUploads: false,
     project: null,
     view: ['feed', 'calendar'].includes(localStorage.getItem('fp-view')) ? localStorage.getItem('fp-view') : 'feed',
     feedTab: localStorage.getItem('fp-tab') === 'stories' ? 'stories' : 'posts',
@@ -127,7 +128,7 @@
         let data = null;
         try { data = JSON.parse(xhr.responseText); } catch { /* ответ не в JSON */ }
         if (xhr.status < 200 || xhr.status >= 300) {
-          const error = new Error(data?.error || 'Ошибка загрузки (' + xhr.status + ')');
+          const error = new Error(data?.error || `Ошибка загрузки (${xhr.status})`);
           error.status = xhr.status;
           reject(error);
           return;
@@ -291,21 +292,95 @@
     return null;
   }
 
-  async function appendMediaFormData(form, items, prefix) {
-    const counts = { image: 0, video: 0 };
-    const order = [];
-    for (const item of items) {
-      const index = counts[item.type]++;
+  async function prepareMediaItems(items, prefix) {
+    return Promise.all(items.map(async (item, index) => {
       if (item.type === 'image') {
         const isStory = prefix === 'story';
         const blob = await item.cropper.toBlob(isStory ? 900 : 1080, isStory ? 0.84 : 0.92);
-        form.append('images', blob, `${prefix}-${index + 1}.jpg`);
-      } else {
-        form.append('videos', item.file, item.file.name);
+        return { type: 'image', blob, contentType: 'image/jpeg', filename: `${prefix}-${index + 1}.jpg` };
       }
-      order.push({ type: item.type, index });
+      const ext = (item.file.name.split('.').pop() || '').toLowerCase();
+      const contentType = ({ mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime' })[ext]
+        || item.file.type.toLowerCase();
+      return { type: 'video', blob: item.file, contentType, filename: item.file.name };
+    }));
+  }
+
+  async function appendMediaFormData(form, items, prefix, prepared = null) {
+    const files = prepared || await prepareMediaItems(items, prefix);
+    const counts = { image: 0, video: 0 };
+    const order = [];
+    for (const file of files) {
+      const index = counts[file.type]++;
+      form.append(file.type === 'image' ? 'images' : 'videos', file.blob, file.filename);
+      order.push({ type: file.type, index });
     }
     form.append('mediaOrder', JSON.stringify(order));
+    return files;
+  }
+
+  function apiMediaStream(method, ticket, blob, contentType = blob?.type || '', onProgress = () => {}) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open(method, '/api/media-upload');
+      xhr.setRequestHeader('X-Media-Ticket', ticket);
+      if (method === 'PUT' && contentType) xhr.setRequestHeader('Content-Type', contentType);
+      if (method === 'PUT') xhr.upload.addEventListener('progress', (event) => {
+        if (event.lengthComputable) onProgress(event.loaded, event.total);
+      });
+      xhr.addEventListener('load', () => {
+        let data = null;
+        try { data = JSON.parse(xhr.responseText); } catch { /* ответ не в JSON */ }
+        if (xhr.status < 200 || xhr.status >= 300) {
+          const error = new Error(data?.error || `Ошибка загрузки (${xhr.status})`);
+          error.status = xhr.status;
+          reject(error);
+          return;
+        }
+        resolve(data);
+      });
+      xhr.addEventListener('error', () => reject(new Error('Соединение оборвалось во время загрузки. Повторите попытку.')));
+      xhr.send(method === 'PUT' ? blob : null);
+    });
+  }
+
+  async function submitMediaMutation(method, url, fields, items, prefix, onProgress = () => {}) {
+    if (!state.streamingUploads || !items?.length) {
+      const form = new FormData();
+      for (const [key, value] of Object.entries(fields || {})) form.append(key, value);
+      if (items?.length) await appendMediaFormData(form, items, prefix);
+      return apiUpload(method, url, form, onProgress);
+    }
+
+    const prepared = await prepareMediaItems(items, prefix);
+    const response = await api('POST', projectUrl() + '/media-tickets', {
+      files: prepared.map((file) => ({ type: file.type, contentType: file.contentType, size: file.blob.size })),
+    });
+    const tickets = response.tickets || [];
+    const totalBytes = prepared.reduce((sum, file) => sum + file.blob.size, 0) || 1;
+    const uploadedBytes = prepared.map(() => 0);
+    let publishRequestSent = false;
+    try {
+      if (tickets.length !== prepared.length) throw new Error('Сервер не подготовил ссылки для всех медиафайлов.');
+      onProgress(0);
+      const outcomes = await Promise.allSettled(tickets.map((entry, index) =>
+        apiMediaStream('PUT', entry.ticket, prepared[index].blob, prepared[index].contentType, (loaded) => {
+          uploadedBytes[index] = loaded;
+          const totalLoaded = uploadedBytes.reduce((sum, value) => sum + value, 0);
+          onProgress(Math.min(100, Math.round(totalLoaded / totalBytes * 100)));
+        })));
+      const failed = outcomes.find((outcome) => outcome.status === 'rejected');
+      if (failed) throw failed.reason;
+      const media = outcomes.map((outcome) => outcome.value);
+      onProgress(100);
+      publishRequestSent = true;
+      return await api(method, url, { ...fields, media });
+    } catch (error) {
+      if (!publishRequestSent || (error.status >= 400 && error.status < 500)) {
+        await Promise.all(tickets.map((entry) => apiMediaStream('DELETE', entry.ticket, null).catch(() => null)));
+      }
+      throw error;
+    }
   }
 
   function mediaThumbnail(media, className = '') {
@@ -582,13 +657,12 @@
       publish.disabled = true;
       publish.textContent = 'Подготовка файлов…';
       try {
-        const fd = new FormData();
-        fd.append('text', txt.ta.value);
-        fd.append('topic', meta.topicEl.value);
-        fd.append('publishAt', meta.dateEl.value);
-        await appendMediaFormData(fd, items, 'post');
-        state.project = await apiUpload('POST', projectUrl() + '/posts', fd, (progress) => {
-          publish.textContent = progress >= 100 ? 'Сохранение…' : 'Загрузка ' + progress + '%';
+        state.project = await submitMediaMutation('POST', projectUrl() + '/posts', {
+          text: txt.ta.value,
+          topic: meta.topicEl.value,
+          publishAt: meta.dateEl.value,
+        }, items, 'post', (progress) => {
+          publish.textContent = progress >= 100 ? 'Сохранение…' : `Загрузка ${progress}%`;
         });
         m.close();
         drawProject();
@@ -673,13 +747,12 @@
         publish.disabled = true;
         publish.textContent = 'Подготовка файлов…';
         try {
-          const fd = new FormData();
-          await appendMediaFormData(fd, items, 'story');
-          fd.append('text', txt.ta.value);
-          fd.append('topic', meta.topicEl.value);
-          fd.append('publishAt', meta.dateEl.value);
-          state.project = await apiUpload('POST', projectUrl() + '/stories', fd, (progress) => {
-            publish.textContent = progress >= 100 ? 'Сохранение…' : 'Загрузка ' + progress + '%';
+          state.project = await submitMediaMutation('POST', projectUrl() + '/stories', {
+            text: txt.ta.value,
+            topic: meta.topicEl.value,
+            publishAt: meta.dateEl.value,
+          }, items, 'story', (progress) => {
+            publish.textContent = progress >= 100 ? 'Сохранение…' : `Загрузка ${progress}%`;
           });
           m.close();
           drawProject();
@@ -1283,18 +1356,14 @@
       const saveLabel = save.textContent;
       save.textContent = 'Сохраняю…';
       try {
-        let payload = {
+        const fields = {
           text: txt.ta.value, topic: meta.topicEl.value, publishAt: meta.dateEl.value,
         };
-        if (replacementItems.length) {
-          const form = new FormData();
-          form.append('text', txt.ta.value);
-          form.append('topic', meta.topicEl.value);
-          form.append('publishAt', meta.dateEl.value);
-          await appendMediaFormData(form, replacementItems, 'post');
-          payload = form;
-        }
-        const updatedProject = await api('PATCH', `${projectUrl()}/posts/${post.id}`, payload);
+        const updatedProject = replacementItems.length
+          ? await submitMediaMutation('PATCH', `${projectUrl()}/posts/${post.id}`, fields, replacementItems, 'post', (progress) => {
+            save.textContent = progress >= 100 ? 'Сохранение…' : `Загрузка ${progress}%`;
+          })
+          : await api('PATCH', `${projectUrl()}/posts/${post.id}`, fields);
         if (replacementItems.length) {
           const updatedPost = updatedProject.posts.find((item) => item.id === post.id);
           const previousMedia = postMedia(post).map((item) => `${item.type}:${item.src}`);
@@ -1483,18 +1552,14 @@
           const saveLabel = save.textContent;
           save.textContent = 'Сохраняю…';
           try {
-            let payload = {
+            const fields = {
               text: txt.ta.value, topic: meta.topicEl.value, publishAt: meta.dateEl.value,
             };
-            if (replacementItems.length) {
-              const form = new FormData();
-              form.append('text', txt.ta.value);
-              form.append('topic', meta.topicEl.value);
-              form.append('publishAt', meta.dateEl.value);
-              await appendMediaFormData(form, replacementItems, 'story');
-              payload = form;
-            }
-            const updatedProject = await api('PATCH', `${projectUrl()}/highlights/${hlId}/stories/${s.id}`, payload);
+            const updatedProject = replacementItems.length
+              ? await submitMediaMutation('PATCH', `${projectUrl()}/highlights/${hlId}/stories/${s.id}`, fields, replacementItems, 'story', (progress) => {
+                save.textContent = progress >= 100 ? 'Сохранение…' : `Загрузка ${progress}%`;
+              })
+              : await api('PATCH', `${projectUrl()}/highlights/${hlId}/stories/${s.id}`, fields);
             if (replacementItems.length) {
               const updatedStory = updatedProject.highlights.find((item) => item.id === hlId)?.stories.find((item) => item.id === s.id);
               const previousMedia = storyMedia(s).map((item) => `${item.type}:${item.src}`);
@@ -1633,6 +1698,7 @@
       const s = await api('GET', sessionUrl);
       state.editor = state.adminMode ? s.editor : (!route && s.editor);
       state.protected = s.protected;
+      state.streamingUploads = !!s.streamingUploads;
     } catch { /* без сессии работаем как зритель */ }
     if (route) {
       await renderProject(route[1]);
@@ -1640,4 +1706,3 @@
     } else await renderHome();
   })();
 })();
-
