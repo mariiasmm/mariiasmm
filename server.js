@@ -617,6 +617,68 @@ const uploadMedia = (req, res, next) => {
   });
 };
 
+const mediaUploadFormats = {
+  'image/jpeg': { type: 'image', ext: 'jpg', maxSize: MAX_UPLOAD },
+  'image/png': { type: 'image', ext: 'png', maxSize: MAX_UPLOAD },
+  'image/webp': { type: 'image', ext: 'webp', maxSize: MAX_UPLOAD },
+  'video/mp4': { type: 'video', ext: 'mp4', maxSize: MAX_VIDEO_UPLOAD },
+  'video/webm': { type: 'video', ext: 'webm', maxSize: MAX_VIDEO_UPLOAD },
+  'video/quicktime': { type: 'video', ext: 'mov', maxSize: MAX_VIDEO_UPLOAD },
+};
+
+function requestError(status, message) {
+  const error = new Error(message);
+  error.status = status;
+  error.expose = true;
+  return error;
+}
+
+function createMediaUploadTicket(project, file) {
+  const format = mediaUploadFormats[String(file?.contentType || '').toLowerCase()];
+  const size = Number(file?.size);
+  if (!format || file?.type !== format.type || !Number.isSafeInteger(size) || size <= 0 || size > format.maxSize) {
+    throw requestError(400, 'Формат или размер медиафайла не поддерживается.');
+  }
+  const filename = rid(12) + '.' + format.ext;
+  const payload = {
+    projectId: project.id,
+    key: project.id + '/' + filename,
+    src: '/uploads/' + project.id + '/' + filename,
+    type: format.type,
+    ext: format.ext,
+    contentType: String(file.contentType).toLowerCase(),
+    size,
+    expiresAt: Date.now() + 10 * 60 * 1000,
+  };
+  const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = crypto.createHmac('sha256', SECRET).update(encoded).digest('base64url');
+  return { ticket: encoded + '.' + signature, type: payload.type, src: payload.src, contentType: payload.contentType };
+}
+
+async function resolveUploadedMediaReferences(project, references) {
+  if (!mediaBucket || !Array.isArray(references) || references.length < 1 || references.length > 10) {
+    throw requestError(400, 'Добавьте от 1 до 10 загруженных медиафайлов.');
+  }
+  const seen = new Set();
+  return Promise.all(references.map(async (item) => {
+    const src = String(item?.src || '');
+    const prefix = '/uploads/' + project.id + '/';
+    if (!src.startsWith(prefix) || seen.has(src)) throw requestError(400, 'В списке загруженных медиафайлов есть ошибка.');
+    seen.add(src);
+    const filename = src.slice(prefix.length);
+    if (!/^[a-zA-Z0-9_.-]+$/.test(filename)) throw requestError(400, 'В списке загруженных медиафайлов есть ошибка.');
+    const ext = filename.split('.').pop().toLowerCase();
+    const expected = Object.values(mediaUploadFormats).find((format) => format.ext === ext);
+    if (!expected || item?.type !== expected.type) throw requestError(400, 'Тип загруженного медиафайла не совпадает.');
+    const stored = await mediaBucket.head(project.id + '/' + filename);
+    const expectedContentType = Object.keys(mediaUploadFormats).find((contentType) => mediaUploadFormats[contentType] === expected);
+    if (!stored || stored.httpMetadata?.contentType !== expectedContentType) {
+      throw requestError(400, 'Не удалось найти загруженный медиафайл. Загрузите его ещё раз.');
+    }
+    return { type: expected.type, src, ...(expected.type === 'video' ? { contentType: stored.httpMetadata.contentType } : {}) };
+  }));
+}
+
 const storyPublishTrace = (stage) => (req, res, next) => {
   req.storyPublishId ||= rid(4);
   console.log(`[story-publish:${req.storyPublishId}] ${stage}`);
@@ -755,7 +817,7 @@ function readImage(req, res) {
 // сессия
 app.get('/api/session', (req, res) => {
   const slug = cleanLine(req.query?.slug, 60);
-  res.json({ editor: isEditor(req, slug || undefined), protected: !!PASSWORD || !!cloudEnv });
+  res.json({ editor: isEditor(req, slug || undefined), protected: !!PASSWORD || !!cloudEnv, streamingUploads: !!mediaBucket });
 });
 
 app.post('/api/login', (req, res) => {
@@ -925,6 +987,19 @@ app.post('/api/projects', requireEditor, remoteMutation, wrap(async (req, res) =
 }));
 
 app.get('/api/projects/:slug', (req, res) => res.json(publicProject(req.project)));
+
+app.post('/api/projects/:slug/media-tickets', requireEditor, (req, res, next) => {
+  if (!mediaBucket) return res.status(404).json({ error: 'Потоковая загрузка доступна только на Cloudflare.' });
+  const files = req.body?.files;
+  if (!Array.isArray(files) || files.length < 1 || files.length > 10) {
+    return res.status(400).json({ error: 'Добавьте от 1 до 10 медиафайлов.' });
+  }
+  try {
+    const videoBytes = files.reduce((sum, file) => sum + (file?.type === 'video' ? Number(file.size) || 0 : 0), 0);
+    if (videoBytes > MAX_VIDEO_UPLOAD) throw requestError(400, 'Общий размер видео не должен превышать 70 МБ.');
+    res.json({ tickets: files.map((file) => createMediaUploadTicket(req.project, file)) });
+  } catch (error) { next(error); }
+});
 
 app.patch('/api/projects/:slug', requireEditor, remoteMutation, wrap(async (req, res) => {
   const name = cleanLine(req.body?.name, LIMITS.projectName);
