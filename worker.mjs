@@ -29,6 +29,9 @@ export default {
     }
 
     const handler = await serverReady;
-    return handler(request, env, ctx);
+    if (typeof handler?.fetch !== 'function') {
+      throw new Error('Cloudflare HTTP handler does not expose a fetch method.');
+    }
+    return handler.fetch(request, env, ctx);
   },
 };
