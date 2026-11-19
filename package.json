@@ -1,0 +1,21 @@
+{
+  "name": "feed-preview",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Минималистичный сервис для публикации и демонстрации постов и историй Instagram по проектам",
+  "main": "server.js",
+  "scripts": {
+    "start": "node start-local.js",
+    "dev:cloudflare": "npx --yes wrangler@4 dev",
+    "deploy:cloudflare": "npx --yes wrangler@4 deploy",
+    "migrate:cloudflare": "npx --yes wrangler@4 d1 migrations apply feed-preview-db --remote"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^5.3.0",
+    "multer": "^2.5.0"
+  }
+}
+
