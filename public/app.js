@@ -68,7 +68,7 @@
   const normalizeMedia = (items) => items.map((item) => typeof item === 'string' ? { type: 'image', src: item } : item).filter((item) => item?.src);
   const postMedia = (post) => normalizeMedia(Array.isArray(post.media) && post.media.length ? post.media : postImages(post));
   const storyMedia = (story) => normalizeMedia(Array.isArray(story.media) && story.media.length ? story.media : storyImages(story));
-  const mediaFileSizeLimit = 100 * 1024 * 1024;
+  const mediaFileSizeLimit = 70 * 1024 * 1024;
   const itemDay = (item) => String(item.publishAt || item.createdAt || '').slice(0, 10);
   const byDay = (a, b) => itemDay(b).localeCompare(itemDay(a)) || String(b.createdAt || '').localeCompare(String(a.createdAt || ''));
   const flatStories = (p) => (p.highlights || []).flatMap((hl) =>
@@ -113,6 +113,31 @@
       throw err;
     }
     return data;
+  }
+
+  function apiUpload(method, url, body, onProgress = () => {}) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open(method, url);
+      if (state.adminMode && method !== 'GET') xhr.setRequestHeader('X-Feed-Admin', '1');
+      xhr.upload.addEventListener('progress', (event) => {
+        if (event.lengthComputable) onProgress(Math.min(100, Math.round(event.loaded / event.total * 100)));
+      });
+      xhr.addEventListener('load', () => {
+        let data = null;
+        try { data = JSON.parse(xhr.responseText); } catch { /* ответ не в JSON */ }
+        if (xhr.status < 200 || xhr.status >= 300) {
+          const error = new Error(data?.error || 'Ошибка загрузки (' + xhr.status + ')');
+          error.status = xhr.status;
+          reject(error);
+          return;
+        }
+        resolve(data);
+      });
+      xhr.addEventListener('error', () => reject(new Error('Соединение оборвалось во время загрузки. Повторите попытку.')));
+      xhr.addEventListener('abort', () => reject(new Error('Загрузка отменена.')));
+      xhr.send(body);
+    });
   }
 
   function toast(msg) {
@@ -475,9 +500,12 @@
         toast('Поддерживаются фото JPG, PNG, WebP и видео MP4, WebM или MOV');
         continue;
       }
-      if (type === 'video' && file.size > mediaFileSizeLimit) {
-        toast('Размер видео не должен превышать 100 МБ');
-        continue;
+      if (type === 'video') {
+        const selectedVideoBytes = items.reduce((sum, item) => sum + (item.type === 'video' ? item.file.size : 0), 0);
+        if (file.size > mediaFileSizeLimit || selectedVideoBytes + file.size > mediaFileSizeLimit) {
+          toast('Общий размер видео в публикации не должен превышать 70 МБ');
+          continue;
+        }
       }
       try {
         if (type === 'video') items.push({ type, file, previewUrl: URL.createObjectURL(file) });
@@ -552,14 +580,16 @@
     const publish = h('button', { class: 'btn primary' }, 'Опубликовать');
     publish.addEventListener('click', async () => {
       publish.disabled = true;
-      publish.textContent = 'Публикация…';
+      publish.textContent = 'Подготовка файлов…';
       try {
         const fd = new FormData();
         fd.append('text', txt.ta.value);
         fd.append('topic', meta.topicEl.value);
         fd.append('publishAt', meta.dateEl.value);
         await appendMediaFormData(fd, items, 'post');
-        state.project = await api('POST', projectUrl() + '/posts', fd);
+        state.project = await apiUpload('POST', projectUrl() + '/posts', fd, (progress) => {
+          publish.textContent = progress >= 100 ? 'Сохранение…' : 'Загрузка ' + progress + '%';
+        });
         m.close();
         drawProject();
         toast('Пост опубликован');
@@ -641,14 +671,16 @@
 
       async function send() {
         publish.disabled = true;
-        publish.textContent = 'Публикация…';
+        publish.textContent = 'Подготовка файлов…';
         try {
           const fd = new FormData();
           await appendMediaFormData(fd, items, 'story');
           fd.append('text', txt.ta.value);
           fd.append('topic', meta.topicEl.value);
           fd.append('publishAt', meta.dateEl.value);
-          state.project = await api('POST', projectUrl() + '/stories', fd);
+          state.project = await apiUpload('POST', projectUrl() + '/stories', fd, (progress) => {
+            publish.textContent = progress >= 100 ? 'Сохранение…' : 'Загрузка ' + progress + '%';
+          });
           m.close();
           drawProject();
           toast('История добавлена');
