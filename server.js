@@ -595,6 +595,12 @@ const uploadMedia = (req, res, next) =>
     uploadError(err, res);
   });
 
+const storyPublishTrace = (stage) => (req, res, next) => {
+  req.storyPublishId ||= rid(4);
+  console.log(`[story-publish:${req.storyPublishId}] ${stage}`);
+  next();
+};
+const logStoryPublish = (req, stage) => console.log(`[story-publish:${req.storyPublishId}] ${stage}`);
 function uploadedMedia(req, res) {
   const files = {
     image: [...(req.files?.images || []), ...(req.files?.image || [])],
@@ -943,7 +949,13 @@ app.delete('/api/projects/:slug/posts/:id', requireEditor, remoteMutation, wrap(
 }));
 
 // истории и «кружки» (актуальное)
-app.post('/api/projects/:slug/stories', requireEditor, uploadMedia, remoteMutation, wrap(async (req, res) => {
+app.post('/api/projects/:slug/stories', requireEditor, storyPublishTrace('request accepted'), uploadMedia, storyPublishTrace('media parsed'), (req, res, next) => {
+  logStoryPublish(req, 'waiting for database lock');
+  remoteMutation(req, res, () => {
+    logStoryPublish(req, 'database lock acquired');
+    next();
+  });
+}, wrap(async (req, res) => {
   const entries = uploadedMedia(req, res);
   if (!entries) return;
   const p = req.project;
@@ -965,7 +977,9 @@ app.post('/api/projects/:slug/stories', requireEditor, uploadMedia, remoteMutati
   }
 
   const createdAt = now();
+  logStoryPublish(req, 'storing media');
   const media = await storeUploadedMedia(p, entries);
+  logStoryPublish(req, 'media stored');
   const images = media.filter((item) => item.type === 'image').map((item) => item.src);
   const story = {
     id: rid(),
@@ -982,7 +996,9 @@ app.post('/api/projects/:slug/stories', requireEditor, uploadMedia, remoteMutati
     p.highlights.push(highlight);
   }
   highlight.stories.push(story);
+  logStoryPublish(req, 'saving database');
   await save();
+  logStoryPublish(req, 'database saved');
   res.status(201).json(publicProject(p));
 }));
 
