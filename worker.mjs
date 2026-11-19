@@ -1,4 +1,4 @@
-import { handleAsNodeRequest } from 'cloudflare:node';
+import { httpServerHandler } from 'cloudflare:node';
 
 // Load Express only after the first Worker request supplies its runtime bindings.
 // Wrangler prints configured bindings during deployment, but Cloudflare exposes
@@ -15,10 +15,11 @@ async function initializeServer(env) {
   if (!app) throw new Error('Could not load the Express application.');
 
   app.listen(port);
+  return httpServerHandler({ port });
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     if (!serverReady) {
       serverReady = initializeServer(env).catch((error) => {
         // Let a later request retry initialization if the first attempt failed.
@@ -27,8 +28,7 @@ export default {
       });
     }
 
-    await serverReady;
-    return handleAsNodeRequest(port, request);
+    const handler = await serverReady;
+    return handler(request, env, ctx);
   },
 };
-
