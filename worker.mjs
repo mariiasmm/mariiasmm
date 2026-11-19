@@ -1,14 +1,34 @@
-import { env } from 'cloudflare:workers';
-import { httpServerHandler } from 'cloudflare:node';
+import { handleAsNodeRequest } from 'cloudflare:node';
 
-// Express uses Cloudflare D1 and R2 for persistent storage.
-globalThis.__FP_CF_ENV = env;
-const serverModule = await import('./server.js');
-const app = serverModule.app || serverModule.default?.app;
+// Load Express only after the first Worker request supplies its runtime bindings.
+// Wrangler prints configured bindings during deployment, but Cloudflare exposes
+// their runtime values to the fetch handler. Deferring server.js also ensures its
+// D1/R2/Assets setup sees those values before the CommonJS module is evaluated.
+const port = 3000;
+let serverReady;
 
-if (!app) throw new Error('Could not load the Express application.');
+async function initializeServer(env) {
+  globalThis.__FP_CF_ENV = env;
 
-const port = Number(env.EXPRESS_PORT) || 3000;
-app.listen(port);
-export default httpServerHandler({ port });
+  const serverModule = await import('./server.js');
+  const app = serverModule.app || serverModule.default?.app;
+  if (!app) throw new Error('Could not load the Express application.');
+
+  app.listen(port);
+}
+
+export default {
+  async fetch(request, env) {
+    if (!serverReady) {
+      serverReady = initializeServer(env).catch((error) => {
+        // Let a later request retry initialization if the first attempt failed.
+        serverReady = undefined;
+        throw error;
+      });
+    }
+
+    await serverReady;
+    return handleAsNodeRequest(port, request);
+  },
+};
 
