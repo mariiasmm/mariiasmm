@@ -272,7 +272,8 @@
     for (const item of items) {
       const index = counts[item.type]++;
       if (item.type === 'image') {
-        const blob = await item.cropper.toBlob(1080);
+        const isStory = prefix === 'story';
+        const blob = await item.cropper.toBlob(isStory ? 900 : 1080, isStory ? 0.84 : 0.92);
         form.append('images', blob, `${prefix}-${index + 1}.jpg`);
       } else {
         form.append('videos', item.file, item.file.name);
@@ -441,7 +442,7 @@
       setZoom(z);
     }, { passive: false });
 
-    async function toBlob(width) {
+    async function toBlob(width, quality = 0.92) {
       const height = Math.round(width / ratio);
       const canvas = document.createElement('canvas');
       canvas.width = width;
@@ -452,7 +453,7 @@
       ctx.imageSmoothingQuality = 'high';
       const s = base * zoom;
       ctx.drawImage(img, -x / s, -y / s, vw / s, vh / s, 0, 0, width, height);
-      const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.92));
+      const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', quality));
       if (!blob) throw new Error('Не удалось подготовить изображение');
       return blob;
     }
@@ -622,7 +623,7 @@
       clearPreviews();
       m.body.replaceChildren(h('div', { class: 'crop-col' },
         cropSlot, thumbs,
-        h('div', { class: 'crop-more' }, addMore, h('span', { class: 'muted' }, 'До 10 файлов; фото обрезаются, MP4/WebM/MOV до 100 МБ добавляются как есть'))));
+        h('div', { class: 'crop-more' }, addMore)));
       paintCrop();
       m.foot.replaceChildren(
         h('button', { class: 'btn', onClick: m.close }, 'Отмена'),
