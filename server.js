@@ -37,7 +37,8 @@ if (cloudEnv && (!configuredPassword || !configuredSecret)) {
 }
 
 const MAX_UPLOAD = 12 * 1024 * 1024; // 12 МБ (фото обрезаются в браузере и обычно весят < 1 МБ)
-const MAX_VIDEO_UPLOAD = 100 * 1024 * 1024;
+const MAX_VIDEO_UPLOAD = 70 * 1024 * 1024;
+const MAX_MEDIA_REQUEST = 70 * 1024 * 1024;
 const MAX_BACKUP_SIZE = 256 * 1024 * 1024;
 const LIMITS = { projectName: 60, highlightTitle: 20, topic: 80, text: 5000 };
 
@@ -584,16 +585,21 @@ app.param('slug', (req, res, next, slug) => {
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_VIDEO_UPLOAD, files: 10 } });
 const uploadBackup = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_BACKUP_SIZE, files: 1 } });
 function uploadError(err, res) {
-  const msg = err.code === 'LIMIT_FILE_SIZE' ? 'Видео слишком большое (до 100 МБ)'
+  const msg = err.code === 'LIMIT_FILE_SIZE' ? 'Видео слишком большое; общий размер медиа — до 70 МБ.'
     : err.code === 'LIMIT_FILE_COUNT' ? 'Можно загрузить не больше 10 медиафайлов'
     : 'Не удалось загрузить файл';
   res.status(400).json({ error: msg });
 }
-const uploadMedia = (req, res, next) =>
-  upload.fields([{ name: 'images', maxCount: 10 }, { name: 'image', maxCount: 1 }, { name: 'videos', maxCount: 10 }])(req, res, (err) => {
+const uploadMedia = (req, res, next) => {
+  const contentLength = Number(req.headers['content-length']);
+  if (Number.isFinite(contentLength) && contentLength > MAX_MEDIA_REQUEST) {
+    return res.status(413).json({ error: 'Общий размер медиафайлов не должен превышать 70 МБ.' });
+  }
+  return upload.fields([{ name: 'images', maxCount: 10 }, { name: 'image', maxCount: 1 }, { name: 'videos', maxCount: 10 }])(req, res, (err) => {
     if (!err) return next();
     uploadError(err, res);
   });
+};
 
 const storyPublishTrace = (stage) => (req, res, next) => {
   req.storyPublishId ||= rid(4);
@@ -649,7 +655,7 @@ function uploadedMedia(req, res) {
     const maxSize = item.type === 'video' ? MAX_VIDEO_UPLOAD : MAX_UPLOAD;
     if (!detected || detected.type !== item.type || file.buffer.length > maxSize) {
       res.status(400).json({ error: item.type === 'video'
-        ? 'Видео должно быть в формате MP4, WebM или MOV и не больше 100 МБ.'
+        ? 'Видео должно быть в формате MP4, WebM или MOV; общий размер медиа — до 70 МБ.'
         : 'Фото поддерживаются в формате JPG, PNG или WebP (до 12 МБ).' });
       return null;
     }
@@ -659,20 +665,59 @@ function uploadedMedia(req, res) {
 }
 
 async function storeUploadedMedia(project, entries) {
-  const result = [];
-  try {
-    for (const entry of entries) {
-      console.log(`[media-upload] storing ${entry.type} (${entry.buffer.length} bytes)`);
-      const src = await storeImage(project, entry.buffer, entry.ext);
-      result.push({ type: entry.type, src, ...(entry.type === 'video' ? { contentType: entry.contentType } : {}) });
-      console.log(`[media-upload] stored ${entry.type}`);
-    }
-    return result;
-  } catch (error) {
-    console.error('[media-upload] storage failed:', error);
+  const outcomes = await Promise.allSettled(entries.map(async (entry) => {
+    console.log('[media-upload] storing ' + entry.type + ' (' + entry.buffer.length + ' bytes)');
+    const src = await storeImage(project, entry.buffer, entry.ext);
+    console.log('[media-upload] stored ' + entry.type);
+    return { type: entry.type, src, ...(entry.type === 'video' ? { contentType: entry.contentType } : {}) };
+  }));
+  const result = outcomes.filter((outcome) => outcome.status === 'fulfilled').map((outcome) => outcome.value);
+  const failure = outcomes.find((outcome) => outcome.status === 'rejected');
+  if (failure) {
+    console.error('[media-upload] storage failed:', failure.reason);
     await Promise.all(result.map((item) => removeImage(item.src)));
-    throw error;
+    throw failure.reason;
   }
+  return result;
+}
+
+function storeMediaThenLock(kind, optional = false) {
+  const log = kind === 'story' ? logStoryPublish : logPostPublish;
+  return (req, res, next) => {
+    const hasFiles = Object.values(req.files || {}).some((files) => files.length);
+    if (optional && !hasFiles) {
+      if (kind === 'story') req.storyPublishId ||= rid(4);
+      else req.postPublishId ||= rid(4);
+      log(req, 'waiting for database lock');
+      return remoteMutation(req, res, (error) => {
+        if (error) return next(error);
+        log(req, 'database lock acquired');
+        next();
+      });
+    }
+    const entries = uploadedMedia(req, res);
+    if (!entries) return;
+    if (kind === 'story') req.storyPublishId ||= rid(4);
+    else req.postPublishId ||= rid(4);
+    log(req, 'storing media');
+    storeUploadedMedia(req.project, entries).then((media) => {
+      req.stagedMedia = media;
+      log(req, 'media stored');
+      log(req, 'waiting for database lock');
+      remoteMutation(req, res, (error) => {
+        if (error) {
+          removeRecordMedia({ media }).catch((cleanupError) => console.error('[media-upload] cleanup failed:', cleanupError))
+            .finally(() => {
+              req.stagedMedia = null;
+              next(error);
+            });
+          return;
+        }
+        log(req, 'database lock acquired');
+        next();
+      });
+    }).catch(next);
+  };
 }
 
 function readImageBuf(file, res) {
@@ -888,18 +933,8 @@ app.delete('/api/projects/:slug', requireEditor, remoteMutation, wrap(async (req
 }));
 
 // посты
-app.post('/api/projects/:slug/posts', requireEditor, postPublishTrace('request accepted'), uploadMedia, postPublishTrace('media parsed'), (req, res, next) => {
-  logPostPublish(req, 'waiting for database lock');
-  remoteMutation(req, res, () => {
-    logPostPublish(req, 'database lock acquired');
-    next();
-  });
-}, wrap(async (req, res) => {
-  const entries = uploadedMedia(req, res);
-  if (!entries) return;
-  logPostPublish(req, 'storing media');
-  const media = await storeUploadedMedia(req.project, entries);
-  logPostPublish(req, 'media stored');
+app.post('/api/projects/:slug/posts', requireEditor, postPublishTrace('request accepted'), uploadMedia, postPublishTrace('media parsed'), storeMediaThenLock('post'), wrap(async (req, res) => {
+  const media = req.stagedMedia;
   const images = media.filter((item) => item.type === 'image').map((item) => item.src);
   const createdAt = now();
   const post = {
@@ -916,19 +951,21 @@ app.post('/api/projects/:slug/posts', requireEditor, postPublishTrace('request a
   logPostPublish(req, 'saving database');
   await save();
   logPostPublish(req, 'database saved');
+  req.stagedMedia = null;
   res.status(201).json(publicProject(req.project));
 }));
 
-app.patch('/api/projects/:slug/posts/:id', requireEditor, uploadMedia, remoteMutation, wrap(async (req, res) => {
+app.patch('/api/projects/:slug/posts/:id', requireEditor, uploadMedia, storeMediaThenLock('post', true), wrap(async (req, res) => {
   const post = req.project.posts.find((p) => p.id === req.params.id);
-  if (!post) return res.status(404).json({ error: 'Пост не найден' });
-  const hasNewMedia = Object.values(req.files || {}).some((files) => files.length);
-  let nextMedia = null;
-  if (hasNewMedia) {
-    const entries = uploadedMedia(req, res);
-    if (!entries) return;
-    nextMedia = await storeUploadedMedia(req.project, entries);
+  if (!post) {
+    if (req.stagedMedia) {
+      await removeRecordMedia({ media: req.stagedMedia });
+      req.stagedMedia = null;
+    }
+    return res.status(404).json({ error: 'Пост не найден' });
   }
+  const hasNewMedia = Object.values(req.files || {}).some((files) => files.length);
+  const nextMedia = hasNewMedia ? req.stagedMedia : null;
 
   const previous = {
     text: post.text,
@@ -952,8 +989,10 @@ app.patch('/api/projects/:slug/posts/:id', requireEditor, uploadMedia, remoteMut
   } catch (error) {
     Object.assign(post, previous);
     if (nextMedia) await removeRecordMedia({ media: nextMedia });
+    req.stagedMedia = null;
     throw error;
   }
+  req.stagedMedia = null;
   if (previousMedia) await removeRecordMedia({ media: previousMedia });
   res.json(publicProject(req.project));
 }));
@@ -968,16 +1007,9 @@ app.delete('/api/projects/:slug/posts/:id', requireEditor, remoteMutation, wrap(
 }));
 
 // истории и «кружки» (актуальное)
-app.post('/api/projects/:slug/stories', requireEditor, storyPublishTrace('request accepted'), uploadMedia, storyPublishTrace('media parsed'), (req, res, next) => {
-  logStoryPublish(req, 'waiting for database lock');
-  remoteMutation(req, res, () => {
-    logStoryPublish(req, 'database lock acquired');
-    next();
-  });
-}, wrap(async (req, res) => {
-  const entries = uploadedMedia(req, res);
-  if (!entries) return;
+app.post('/api/projects/:slug/stories', requireEditor, storyPublishTrace('request accepted'), uploadMedia, storyPublishTrace('media parsed'), storeMediaThenLock('story'), wrap(async (req, res) => {
   const p = req.project;
+  const media = req.stagedMedia;
 
   let highlight = null;
   let newTitle = '';
@@ -996,9 +1028,6 @@ app.post('/api/projects/:slug/stories', requireEditor, storyPublishTrace('reques
   }
 
   const createdAt = now();
-  logStoryPublish(req, 'storing media');
-  const media = await storeUploadedMedia(p, entries);
-  logStoryPublish(req, 'media stored');
   const images = media.filter((item) => item.type === 'image').map((item) => item.src);
   const story = {
     id: rid(),
@@ -1018,6 +1047,7 @@ app.post('/api/projects/:slug/stories', requireEditor, storyPublishTrace('reques
   logStoryPublish(req, 'saving database');
   await save();
   logStoryPublish(req, 'database saved');
+  req.stagedMedia = null;
   res.status(201).json(publicProject(p));
 }));
 
@@ -1040,17 +1070,18 @@ app.delete('/api/projects/:slug/highlights/:id', requireEditor, remoteMutation, 
   res.json(publicProject(req.project));
 }));
 
-app.patch('/api/projects/:slug/highlights/:hid/stories/:sid', requireEditor, uploadMedia, remoteMutation, wrap(async (req, res) => {
+app.patch('/api/projects/:slug/highlights/:hid/stories/:sid', requireEditor, uploadMedia, storeMediaThenLock('story', true), wrap(async (req, res) => {
   const h = req.project.highlights.find((x) => x.id === req.params.hid);
   const story = h?.stories.find((s) => s.id === req.params.sid);
-  if (!story) return res.status(404).json({ error: 'История не найдена' });
-  const hasNewMedia = Object.values(req.files || {}).some((files) => files.length);
-  let nextMedia = null;
-  if (hasNewMedia) {
-    const entries = uploadedMedia(req, res);
-    if (!entries) return;
-    nextMedia = await storeUploadedMedia(req.project, entries);
+  if (!story) {
+    if (req.stagedMedia) {
+      await removeRecordMedia({ media: req.stagedMedia });
+      req.stagedMedia = null;
+    }
+    return res.status(404).json({ error: 'История не найдена' });
   }
+  const hasNewMedia = Object.values(req.files || {}).some((files) => files.length);
+  const nextMedia = hasNewMedia ? req.stagedMedia : null;
   const previous = {
     text: story.text,
     topic: story.topic,
@@ -1073,8 +1104,10 @@ app.patch('/api/projects/:slug/highlights/:hid/stories/:sid', requireEditor, upl
   } catch (error) {
     Object.assign(story, previous);
     if (nextMedia) await removeRecordMedia({ media: nextMedia });
+    req.stagedMedia = null;
     throw error;
   }
+  req.stagedMedia = null;
   if (previousMedia) await removeRecordMedia({ media: previousMedia });
   res.json(publicProject(req.project));
 }));
@@ -1096,8 +1129,19 @@ app.use('/api', (req, res) => res.status(404).json({ error: 'Не найдено
 app.use((err, req, res, next) => {
   const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 500;
   if (status >= 500) console.error(err);
-  if (req.path.startsWith('/api')) return res.status(status).json({ error: status === 500 ? 'Ошибка сервера' : 'Некорректный запрос' });
-  res.status(status).type('text/plain').send(status === 500 ? 'Ошибка сервера' : 'Некорректный запрос');
+  const respond = () => {
+    if (req.path.startsWith('/api')) return res.status(status).json({ error: err.expose ? err.message : status === 500 ? 'Ошибка сервера' : 'Некорректный запрос' });
+    res.status(status).type('text/plain').send(err.expose ? err.message : status === 500 ? 'Ошибка сервера' : 'Некорректный запрос');
+  };
+  if (Array.isArray(req.stagedMedia) && req.stagedMedia.length) {
+    const media = req.stagedMedia;
+    req.stagedMedia = null;
+    removeRecordMedia({ media })
+      .catch((cleanupError) => console.error('[media-upload] cleanup failed:', cleanupError))
+      .finally(respond);
+    return;
+  }
+  respond();
 });
 
 if (!cloudEnv) {
