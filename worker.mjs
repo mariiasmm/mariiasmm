@@ -8,6 +8,7 @@ const app = serverModule.app || serverModule.default?.app;
 
 if (!app) throw new Error('Could not load the Express application.');
 
-app.listen(3000);
-export default httpServerHandler({ port: 3000 });
+const port = Number(env.EXPRESS_PORT) || 3000;
+app.listen(port);
+export default httpServerHandler({ port });
 
