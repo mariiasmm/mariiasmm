@@ -164,6 +164,11 @@ async function acquireRemoteLock() {
     if (result.meta?.changes > 0) return token;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+  const lockState = await remoteDb.prepare('SELECT lock_until FROM app_state WHERE id = 1').first().catch(() => null);
+  console.error('[d1-lock] timed out waiting for the write lock', {
+    lockUntil: lockState?.lock_until ?? null,
+    observedAt: Date.now(),
+  });
   const error = new Error('База занята другой операцией. Повторите запрос через несколько секунд.');
   error.status = 503;
   error.expose = true;
@@ -173,27 +178,38 @@ async function acquireRemoteLock() {
 function remoteMutation(req, res, next) {
   if (!remoteDb) return next();
   acquireRemoteLock().then(async (token) => {
-    let released = false;
+    let releasePromise = null;
     const release = () => {
-      if (released) return;
-      released = true;
-      remoteDb.prepare('UPDATE app_state SET lock_token = NULL, lock_until = NULL WHERE id = 1 AND lock_token = ?')
-        .bind(token).run().catch((error) => console.error('Could not release D1 write lock:', error));
+      if (!releasePromise) {
+        releasePromise = remoteDb.prepare('UPDATE app_state SET lock_token = NULL, lock_until = NULL WHERE id = 1 AND lock_token = ?')
+          .bind(token).run().catch((error) => {
+            console.error('Could not release D1 write lock:', error);
+            releasePromise = null;
+          });
+      }
+      return releasePromise;
     };
     try {
       await reloadRemoteDatabase();
       if (req.params?.slug) {
         req.project = db.projects.find((project) => project.slug === req.params.slug);
         if (!req.project) {
-          release();
+          await release();
           return res.status(404).json({ error: 'Проект не найден' });
         }
       }
-      res.once('finish', release);
       res.once('close', release);
+      const originalEnd = res.end;
+      let ending = false;
+      res.end = function (...args) {
+        if (ending) return res;
+        ending = true;
+        release().finally(() => originalEnd.apply(res, args));
+        return res;
+      };
       next();
     } catch (error) {
-      release();
+      await release();
       next(error);
     }
   }).catch(next);
