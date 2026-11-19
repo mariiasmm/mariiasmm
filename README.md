@@ -79,9 +79,9 @@ data/            создаётся при запуске: db.json + uploads/
 
 1. Войдите в Cloudflare командой `npx --yes wrangler@4 login`.
 2. Создайте хранилище медиа: `npx --yes wrangler@4 r2 bucket create feed-preview-media`.
-3. Задайте пароль администратора: `npx --yes wrangler@4 secret put ADMIN_PASSWORD` и введите свой пароль в приглашении CLI.
-4. Задайте секрет сессии: `npx --yes wrangler@4 secret put SESSION_SECRET` и введите случайную строку длиной не менее 32 символов. Не публикуйте эти значения и не добавляйте их в GitHub.
-5. Примените схему и опубликуйте приложение: `npx --yes wrangler@4 d1 migrations apply feed-preview-db --remote`, затем `npx --yes wrangler@4 deploy`.
+3. Скопируйте `.env.example` в `.env` (если `.env` уже существует, сохраните его и добавьте туда обе переменные). Укажите личный пароль в `ADMIN_PASSWORD` и случайную строку не короче 32 символов в `SESSION_SECRET`.
+4. Примените схему: `npx --yes wrangler@4 d1 migrations apply feed-preview-db --remote`.
+5. Выполните первый deploy вместе с секретами: `npx --yes wrangler@4 deploy --secrets-file .env`. Файл `.env` исключён из Git; не отправляйте его в GitHub или в чат.
 
 Для автоматических публикаций откройте GitHub → `mariiasmm/mariiasmm` → **Settings → Secrets and variables → Actions → New repository secret**. Добавьте `CLOUDFLARE_API_TOKEN` и `CLOUDFLARE_ACCOUNT_ID`. Для токена используйте права **Workers Editor** и **D1 Editor** на нужном аккаунте. До добавления обоих секретов workflow пропускает deploy; после добавления запустите его один раз в **Actions → Deploy to Cloudflare Workers → Run workflow**, а следующие изменения в `main` будут публиковаться автоматически.
 
