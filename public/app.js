@@ -544,7 +544,7 @@
     });
 
     m.body.append(h('div', { class: 'wizard two' },
-      h('div', { class: 'crop-col' }, cropSlot, thumbs, h('div', { class: 'crop-more' }, addMore, h('span', { class: 'muted' }, 'До 10 файлов; фото обрезаются, MP4/WebM/MOV до 100 МБ добавляются как есть'))),
+      h('div', { class: 'crop-col' }, cropSlot, thumbs, h('div', { class: 'crop-more' }, addMore)),
       h('div', {}, meta.box, txt.box)));
     paintCrop();
 
