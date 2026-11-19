@@ -601,6 +601,12 @@ const storyPublishTrace = (stage) => (req, res, next) => {
   next();
 };
 const logStoryPublish = (req, stage) => console.log(`[story-publish:${req.storyPublishId}] ${stage}`);
+const postPublishTrace = (stage) => (req, res, next) => {
+  req.postPublishId ||= rid(4);
+  console.log(`[post-publish:${req.postPublishId}] ${stage}`);
+  next();
+};
+const logPostPublish = (req, stage) => console.log(`[post-publish:${req.postPublishId}] ${stage}`);
 function uploadedMedia(req, res) {
   const files = {
     image: [...(req.files?.images || []), ...(req.files?.image || [])],
@@ -656,11 +662,14 @@ async function storeUploadedMedia(project, entries) {
   const result = [];
   try {
     for (const entry of entries) {
+      console.log(`[media-upload] storing ${entry.type} (${entry.buffer.length} bytes)`);
       const src = await storeImage(project, entry.buffer, entry.ext);
       result.push({ type: entry.type, src, ...(entry.type === 'video' ? { contentType: entry.contentType } : {}) });
+      console.log(`[media-upload] stored ${entry.type}`);
     }
     return result;
   } catch (error) {
+    console.error('[media-upload] storage failed:', error);
     await Promise.all(result.map((item) => removeImage(item.src)));
     throw error;
   }
@@ -879,10 +888,18 @@ app.delete('/api/projects/:slug', requireEditor, remoteMutation, wrap(async (req
 }));
 
 // посты
-app.post('/api/projects/:slug/posts', requireEditor, uploadMedia, remoteMutation, wrap(async (req, res) => {
+app.post('/api/projects/:slug/posts', requireEditor, postPublishTrace('request accepted'), uploadMedia, postPublishTrace('media parsed'), (req, res, next) => {
+  logPostPublish(req, 'waiting for database lock');
+  remoteMutation(req, res, () => {
+    logPostPublish(req, 'database lock acquired');
+    next();
+  });
+}, wrap(async (req, res) => {
   const entries = uploadedMedia(req, res);
   if (!entries) return;
+  logPostPublish(req, 'storing media');
   const media = await storeUploadedMedia(req.project, entries);
+  logPostPublish(req, 'media stored');
   const images = media.filter((item) => item.type === 'image').map((item) => item.src);
   const createdAt = now();
   const post = {
@@ -896,7 +913,9 @@ app.post('/api/projects/:slug/posts', requireEditor, uploadMedia, remoteMutation
     createdAt,
   };
   req.project.posts.unshift(post); // новые — в начале сетки
+  logPostPublish(req, 'saving database');
   await save();
+  logPostPublish(req, 'database saved');
   res.status(201).json(publicProject(req.project));
 }));
 
@@ -1076,7 +1095,7 @@ app.use('/api', (req, res) => res.status(404).json({ error: 'Не найдено
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   const status = err.status && err.status >= 400 && err.status < 600 ? err.status : 500;
-  if (status === 500) console.error(err);
+  if (status >= 500) console.error(err);
   if (req.path.startsWith('/api')) return res.status(status).json({ error: status === 500 ? 'Ошибка сервера' : 'Некорректный запрос' });
   res.status(status).type('text/plain').send(status === 500 ? 'Ошибка сервера' : 'Некорректный запрос');
 });
