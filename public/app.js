@@ -1698,7 +1698,12 @@
       const s = await api('GET', sessionUrl);
       state.editor = state.adminMode ? s.editor : (!route && s.editor);
       state.protected = s.protected;
-      state.streamingUploads = !!s.streamingUploads;
+      // The production Worker supports R2 streaming uploads even if an old or
+      // cached session response omits the capability flag. Keep local Node on
+      // the multipart path, but never send large multipart requests to CF.
+      state.streamingUploads = !!s.streamingUploads
+        || location.hostname === 'smm.mariadigital.org'
+        || location.hostname === 'feed-preview.mariasmm.workers.dev';
     } catch { /* без сессии работаем как зритель */ }
     if (route) {
       await renderProject(route[1]);
