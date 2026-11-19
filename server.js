@@ -10,10 +10,13 @@ const { Readable } = require('stream');
 /* ───────────── настройки ───────────── */
 
 const PORT = Number(process.env.PORT) || 3000;
-const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
+// Cloudflare Workers run the bundled app as an ES module and do not define __dirname.
+// A local base path is only needed by the filesystem-backed Node.js mode.
+const APP_DIR = typeof __dirname === 'undefined' ? '.' : __dirname;
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(APP_DIR, 'data'));
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
-const PUBLIC_DIR = path.join(__dirname, 'public');
+const PUBLIC_DIR = path.join(APP_DIR, 'public');
 const cloudEnv = globalThis.__FP_CF_ENV || null;
 const remoteDb = cloudEnv?.DB || null;
 const mediaBucket = cloudEnv?.MEDIA || null;
